@@ -155,11 +155,12 @@ def _extract_year_range(qp: QueryPlan) -> Optional[Tuple[int, int]]:
 def _apply_defaults(qp: QueryPlan) -> None:
     if not qp.select:
         qp.select = list(_DEFAULT_SELECT)
-    # Only add GROUP BY when aggregations are present (avoids PG error)
     if qp.aggregations and not qp.group_by:
         qp.group_by = list(_DEFAULT_GROUP_BY)
 
-    # ── guard against data-destroying limits ─────────────────
+    # ── resolve limit ────────────────────────────────────────
+    if qp.limit is None:
+        qp.limit = _qcfg.default_limit
     if qp.limit < _qcfg.min_limit:
         logger.info(
             "Limit raised from %d → %d (configured minimum)",

@@ -81,7 +81,7 @@ class QueryPlan(BaseModel):
     filters: Optional[List[Filter]] = None
     group_by: Optional[List[Column]] = None
     order_by: Optional[List[OrderBy]] = None
-    limit: int = Field(default=20, le=200)
+    limit: Optional[int] = None
     condition_text: Optional[str] = None
 
 

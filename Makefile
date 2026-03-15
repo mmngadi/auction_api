@@ -2,12 +2,14 @@
 #  Auction Intelligence API — environment orchestration
 # ──────────────────────────────────────────────────────────────
 
+-include .env
+
 COMPOSE   := docker compose
-MAKE 	  := make
 SERVICE   := auction_db
-DB_USER   := postgres
-DB_NAME   := auction
-API_PORT  := 8000
+DB_USER   ?= postgres
+DB_NAME   ?= auction
+API_PORT  ?= 8000
+MAKE = make
 
 .DEFAULT_GOAL := help
 
@@ -64,7 +66,7 @@ makes: ## List distinct makes and their counts
 
 # ── API ───────────────────────────────────────────────────────
 
-.PHONY: api health test-chat
+.PHONY: api health test-chat test-stream test-stdout-stream
 
 api: ## Start the FastAPI server
 	python run.py
@@ -72,11 +74,22 @@ api: ## Start the FastAPI server
 health: ## Hit the /health endpoint
 	@curl -sS http://localhost:$(API_PORT)/health | python -m json.tool
 
-test-chat: ## Send a smoke-test prompt to /chat
-	@curl -sS -X POST http://localhost:$(API_PORT)/chat \
+test-chat: ## Send a smoke-test prompt (non-streaming)
+	@curl -sS -X POST http://localhost:$(API_PORT)/v1/chat/completions \
 		-H "Content-Type: application/json" \
-		-d '{"prompt":"What car makes are available in the auction database?"}' \
+		-d '{"messages":[{"role":"user","content":"What car makes are available in the auction database?"}]}' \
 		| python -m json.tool
+
+test-stream: ## Send a smoke-test prompt (streaming SSE)
+	@curl -sN -X POST http://localhost:$(API_PORT)/v1/chat/completions \
+		-H "Content-Type: application/json" \
+		-d '{"messages":[{"role":"user","content":"What is the average bid for Toyota?"}],"stream":true}'
+
+test-stdout-stream: ## Stream a chat response directly to stdout
+	@curl -sN -X POST http://localhost:$(API_PORT)/v1/chat/completions \
+		-H "Content-Type: application/json" \
+		-d '{"messages":[{"role":"user","content":"What is the average bid for Toyota?"}],"stream":true}' \
+		| python -c "import sys,json;[print(json.loads(l[6:])['choices'][0]['delta'].get('content',''),end='',flush=True) for l in sys.stdin if l.strip().startswith('data: {')];print()"
 
 # ── Cleanup ───────────────────────────────────────────────────
 

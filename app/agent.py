@@ -1,13 +1,10 @@
 """
-LLM agent orchestration.
+LLM agent orchestration — non-streaming and streaming paths.
 
-Fixes vs. v1
-─────────────
-• Strips Qwen-3 <think> blocks so visible content is never empty.
-• Uses a **plain** LLM (no tools) for the final summarisation pass.
-• Adds DEBUG-level breadcrumbs for every iteration, tool result and
-  content preview — visible with LOG_LEVEL=DEBUG.
-• Graceful fallback when the model still produces nothing.
+Public API
+──────────
+    run_agent(prompt)          → str              (blocking, full answer)
+    run_agent_stream(prompt)   → Generator[str]   (yields tokens for SSE)
 """
 
 from __future__ import annotations
@@ -15,7 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Generator, Optional, Tuple
 
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from langchain_ollama import ChatOllama
@@ -27,40 +24,75 @@ from .utils import make_json_safe
 logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────
-# THINK-TAG HANDLING  (Qwen-3 series)
+# THINK-TAG HANDLING (Qwen-3 series)
 # ─────────────────────────────────────────────────────────────
 
 _THINK_RE = re.compile(r"<think>[\s\S]*?</think>\s*")
 
 
 def _extract_content(response) -> str:
-    """
-    Return the *visible* answer from an ``AIMessage``.
-
-    Qwen-3 models emit ``<think>…</think>`` blocks before the answer.
-    If the model accidentally puts **all** text inside the tags (and
-    nothing outside), we fall back to the thinking content itself.
-    """
+    """Return visible text from a complete AIMessage, stripping <think> blocks."""
     raw: str = getattr(response, "content", None) or ""
     if not raw.strip():
         return ""
-
-    # 1. Strip think blocks → keep everything outside
     outside = _THINK_RE.sub("", raw).strip()
     if outside:
         return outside
-
-    # 2. Fallback: use the content *inside* the think block
     match = re.search(r"<think>([\s\S]+)</think>", raw)
     if match:
-        logger.warning("All content was inside <think> tags — using it as fallback.")
+        logger.warning("All content inside <think> tags — using as fallback.")
         return match.group(1).strip()
-
     return raw.strip()
 
 
+class _ThinkFilter:
+    """
+    Streaming filter: buffers tokens until any ``<think>…</think>``
+    block has passed, then forwards all subsequent tokens verbatim.
+    """
+
+    __slots__ = ("_buf", "_done")
+
+    def __init__(self):
+        self._buf: list[str] = []
+        self._done = False
+
+    def feed(self, token: str) -> str:
+        """Feed one token; returns text to emit (may be empty while buffering)."""
+        if self._done:
+            return token
+
+        self._buf.append(token)
+        joined = "".join(self._buf)
+
+        # Content clearly doesn't start with <think>
+        stripped = joined.lstrip()
+        if len(stripped) >= 7 and not stripped.startswith("<think>"):
+            self._done = True
+            self._buf.clear()
+            return joined
+
+        # End of think block found
+        if "</think>" in joined:
+            self._done = True
+            self._buf.clear()
+            return joined.split("</think>", 1)[1].lstrip()
+
+        return ""
+
+    def flush(self) -> str:
+        """Return any remaining buffered text at end-of-stream."""
+        if not self._buf:
+            return ""
+        joined = "".join(self._buf)
+        self._buf.clear()
+        if "<think>" in joined and "</think>" not in joined:
+            return joined.split("<think>", 1)[1].strip()
+        return joined
+
+
 # ─────────────────────────────────────────────────────────────
-# PROMPT CONSTANTS  (unchanged from v1 — repeated for completeness)
+# PROMPT CONSTANTS
 # ─────────────────────────────────────────────────────────────
 
 DATABASE_SCHEMA = """\
@@ -139,18 +171,16 @@ _TOOLS = list(_TOOL_MAP.values())
 
 # ─────────────────────────────────────────────────────────────
 # LLM INSTANCES
-#
-#   _llm            → plain model for free-text summarisation
-#   _llm_with_tools → same model with tools bound (agent loop)
 # ─────────────────────────────────────────────────────────────
 
 _llm = ChatOllama(
     model=settings.ollama.chat_model,
     base_url=settings.ollama.base_url,
     temperature=0,
-    num_predict=4096,
+    num_predict=settings.ollama.num_predict,
 )
 _llm_with_tools = _llm.bind_tools(_TOOLS)
+
 
 # ─────────────────────────────────────────────────────────────
 # PUBLIC API
@@ -158,56 +188,82 @@ _llm_with_tools = _llm.bind_tools(_TOOLS)
 
 
 def run_agent(prompt: str) -> str:
+    """Non-streaming: returns the complete answer string."""
+    messages, tool_result, direct = _run_tool_loop(prompt)
+    if tool_result is not None:
+        return _summarise(prompt, tool_result, messages)
+    return direct or "No response generated — please rephrase your question."
+
+
+def run_agent_stream(prompt: str) -> Generator[str, None, None]:
+    """Streaming: yields text chunks as the summarisation LLM produces them."""
+    messages, tool_result, direct = _run_tool_loop(prompt)
+    if tool_result is not None:
+        yield from _summarise_stream(prompt, tool_result, messages)
+    else:
+        yield direct or "No response generated — please rephrase your question."
+
+
+# ─────────────────────────────────────────────────────────────
+# TOOL LOOP  (shared by both paths)
+# ─────────────────────────────────────────────────────────────
+
+
+def _run_tool_loop(
+    prompt: str,
+) -> Tuple[list, Optional[Dict[str, Any]], Optional[str]]:
+    """
+    Execute the agent's tool-calling loop.
+
+    Returns
+    -------
+    (messages, tool_result, direct_content)
+        • tool_result is the best successful result, or None.
+        • direct_content is set when the LLM answered without tools.
+    """
     messages: list = [
         SystemMessage(content=SYSTEM_PROMPT),
         HumanMessage(content=prompt),
     ]
 
-    best_result: Optional[Dict[str, Any]] = None   # ← last *successful* result
-    latest_result: Optional[Dict[str, Any]] = None  # ← most recent (may be error)
+    best_result: Optional[Dict[str, Any]] = None
+    latest_result: Optional[Dict[str, Any]] = None
     tool_invoked = False
 
     for iteration in range(settings.max_agent_iterations):
         response = _llm_with_tools.invoke(messages)
         messages.append(response)
 
-        has_tool_calls = bool(getattr(response, "tool_calls", None))
+        has_tc = bool(getattr(response, "tool_calls", None))
         logger.debug(
-            "Iter %d | tool_calls=%s | content_len=%d | preview=%.300s",
+            "Iter %d | tool_calls=%s | content_len=%d",
             iteration,
-            has_tool_calls,
+            has_tc,
             len(getattr(response, "content", "") or ""),
-            (getattr(response, "content", "") or "")[:300],
         )
 
-        if not has_tool_calls:
-            # Prefer the successful result; fall back to latest
+        # ── No tool calls → exit loop ───────────────────────
+        if not has_tc:
             effective = best_result or latest_result
             if tool_invoked and effective is not None:
-                return _summarise(prompt, effective, messages)
-            content = _extract_content(response)
-            return content or "No response generated — please rephrase your question."
+                return messages, effective, None
+            return messages, None, _extract_content(response)
 
+        # ── Execute each tool call ───────────────────────────
         tool_invoked = True
         for tc in response.tool_calls:
-            logger.info(
-                "Tool call → %s | arg_keys=%s",
-                tc.get("name"),
-                list(tc.get("args", {}).keys()),
-            )
+            logger.info("Tool call → %s", tc.get("name"))
             result = _invoke_tool(tc)
             latest_result = make_json_safe(result)
 
-            # Track best (non-error) result
             if isinstance(latest_result, dict) and "error" not in latest_result:
                 best_result = latest_result
 
             if isinstance(latest_result, dict):
                 logger.debug(
-                    "Tool result | rows=%s | error=%s | warnings=%s",
+                    "Tool result | rows=%s | error=%s",
                     len(latest_result.get("rows", [])),
-                    latest_result.get("error", "-"),
-                    latest_result.get("warnings", []),
+                    latest_result.get("error", "–"),
                 )
 
             messages.append(
@@ -217,21 +273,145 @@ def run_agent(prompt: str) -> str:
                 )
             )
 
-    return "The agent reached its iteration limit without a final answer."
+    # Iteration limit reached
+    effective = best_result or latest_result
+    if effective is not None:
+        return messages, effective, None
+    return messages, None, "Agent reached its iteration limit."
 
 
 # ─────────────────────────────────────────────────────────────
-# PRIVATE HELPERS
+# SUMMARISATION  (non-streaming)
 # ─────────────────────────────────────────────────────────────
+
+
+def _summarise(
+    prompt: str,
+    tool_result: Dict[str, Any],
+    messages: list,
+) -> str:
+    content = _build_summarisation_prompt(prompt, tool_result)
+    messages.append(HumanMessage(content=content))
+
+    final = _llm.invoke(messages)
+    answer = _extract_content(final)
+
+    if answer:
+        return answer
+
+    logger.warning("Summarisation returned empty content.")
+    return _fallback_text(tool_result)
+
+
+# ─────────────────────────────────────────────────────────────
+# SUMMARISATION  (streaming)
+# ─────────────────────────────────────────────────────────────
+
+
+def _summarise_stream(
+    prompt: str,
+    tool_result: Dict[str, Any],
+    messages: list,
+) -> Generator[str, None, None]:
+    """Yield text tokens from the summarisation LLM, stripping think-tags."""
+    content = _build_summarisation_prompt(prompt, tool_result)
+    messages.append(HumanMessage(content=content))
+
+    think_filter = _ThinkFilter()
+    yielded = False
+
+    for chunk in _llm.stream(messages):
+        text = chunk.content or ""
+        if not text:
+            continue
+        filtered = think_filter.feed(text)
+        if filtered:
+            yield filtered
+            yielded = True
+
+    remaining = think_filter.flush()
+    if remaining:
+        yield remaining
+        yielded = True
+
+    if not yielded:
+        yield _fallback_text(tool_result)
+
+
+# ─────────────────────────────────────────────────────────────
+# SHARED HELPERS
+# ─────────────────────────────────────────────────────────────
+
+
+def _fallback_text(tool_result: Dict[str, Any]) -> str:
+    """Last-resort plain-text when the LLM produces nothing."""
+    rows = tool_result.get("rows", [])
+    if rows:
+        preview = json.dumps(rows[:5], indent=2)
+        return (
+            f"Retrieved {len(rows)} record(s). "
+            f"Sample:\n```json\n{preview}\n```"
+        )
+    if "error" in tool_result:
+        return f"Query failed: {tool_result['error']}"
+    return "No matching records found."
+
+
+def _build_summarisation_prompt(
+    prompt: str, tool_result: Dict[str, Any]
+) -> str:
+    rows = tool_result.get("rows", [])
+    warnings = tool_result.get("warnings", [])
+    broadened = any("broadened" in w.lower() for w in warnings)
+    has_error = "error" in tool_result
+
+    warnings_block = ""
+    if warnings:
+        lines = "\n".join(f"  • {w}" for w in warnings)
+        warnings_block = f"\nSQL-compiler warnings:\n{lines}\n"
+
+    if has_error:
+        return (
+            f"User question:\n{prompt}\n\n"
+            f"The query encountered an error:\n  {tool_result['error']}\n\n"
+            f"{warnings_block}"
+            "Explain the problem and suggest how to adjust the question.\n"
+        )
+
+    if not rows:
+        return (
+            f"User question:\n{prompt}\n\n"
+            "The database returned **no matching records**.\n\n"
+            "IMPORTANT: Do NOT provide general market advice.\n"
+            f"{warnings_block}\n"
+            "Suggest broadening the search.\n"
+        )
+
+    extras = ""
+    if broadened:
+        extras = "• Results include broadened keyword fallback.\n"
+    return (
+        f"User question:\n{prompt}\n\n"
+        "Auction results (mileage ±25 000 km · year ±5 · "
+        "semantic condition search):\n"
+        f"{json.dumps(tool_result, indent=2)}\n\n"
+        f"{warnings_block}"
+        "Notes:\n"
+        "• Mileage ranges are ±25 000 km.\n"
+        "• Condition grouping may use semantic embeddings.\n"
+        f"{extras}\n"
+        "Using ONLY the data above, provide:\n"
+        "• A fair bid / price range in Rands.\n"
+        "• Assumptions and reasoning.\n"
+        "• Uncertainty caveats.\n"
+    )
 
 
 def _invoke_tool(tool_call: dict) -> Any:
     fn = _TOOL_MAP.get(tool_call.get("name", ""))
     if fn is None:
         return {"error": f"Unknown tool: {tool_call.get('name')}"}
-
     args = _coerce_tool_args(tool_call.get("args", {}))
-
     try:
         return fn.invoke(args)
     except Exception as exc:
@@ -240,10 +420,7 @@ def _invoke_tool(tool_call: dict) -> Any:
 
 
 def _coerce_tool_args(args: dict) -> dict:
-    """
-    LLMs occasionally emit a JSON *string* where a dict is expected.
-    Detect this and ``json.loads`` it so Pydantic validation passes.
-    """
+    """Deserialise any JSON-string values that the LLM should have sent as dicts."""
     out = {}
     for key, value in args.items():
         if isinstance(value, str):
@@ -255,93 +432,3 @@ def _coerce_tool_args(args: dict) -> dict:
                 pass
         out[key] = value
     return out
-
-
-def _summarise(
-    prompt: str,
-    tool_result: Dict[str, Any],
-    messages: list,
-) -> str:
-    """Build a summarisation prompt, invoke the *plain* LLM, and return text."""
-    content = _build_summarisation_prompt(prompt, tool_result)
-    messages.append(HumanMessage(content=content))
-
-    final = _llm.invoke(messages)  # ← no tools bound
-    answer = _extract_content(final)
-
-    if answer:
-        return answer
-
-    # ── Last-resort fallback ─────────────────────────────────
-    logger.warning("Summarisation produced empty content — returning raw data.")
-    rows = tool_result.get("rows", [])
-    if rows:
-        preview = json.dumps(rows[:5], indent=2)
-        return (
-            f"I retrieved {len(rows)} auction record(s) but could not "
-            f"generate a narrative summary.  Here is a sample:\n\n```json\n{preview}\n```"
-        )
-    if "error" in tool_result:
-        return f"The database query failed: {tool_result['error']}"
-    return "The database returned no matching records for your query."
-
-
-def _build_summarisation_prompt(prompt: str, tool_result: Dict[str, Any]) -> str:
-    """Return the human-message text that asks the LLM to summarise."""
-    rows = tool_result.get("rows", [])
-    warnings = tool_result.get("warnings", [])
-    broadened = any("broadened" in w.lower() for w in warnings)
-    has_error = "error" in tool_result
-
-    warnings_block = ""
-    if warnings:
-        lines = "\n".join(f"  • {w}" for w in warnings)
-        warnings_block = f"\nSQL-compiler warnings:\n{lines}\n"
-
-    # ── query error ──────────────────────────────────────────
-    if has_error:
-        return (
-            f"User question:\n{prompt}\n\n"
-            f"The query encountered an error:\n  {tool_result['error']}\n\n"
-            f"{warnings_block}"
-            "Explain the problem in plain language and suggest how the "
-            "user can adjust their question (spelling, broader ranges, etc.).\n"
-        )
-
-    # ── no rows ──────────────────────────────────────────────
-    if not rows:
-        return (
-            f"User question:\n{prompt}\n\n"
-            "The database returned **no matching records**.\n\n"
-            "IMPORTANT: Do NOT provide general market advice — only "
-            "data-backed recommendations are permitted.\n"
-            f"{warnings_block}\n"
-            "Suggest the user:\n"
-            "• Confirm the make / model spelling.\n"
-            "• Widen the year range.\n"
-            "• Broaden the mileage tolerance.\n"
-            "• Search using condition keywords.\n"
-        )
-
-    # ── has rows → full summarisation ────────────────────────
-    extras = ""
-    if broadened:
-        extras = (
-            "• Some results came from a broadened keyword fallback — "
-            "reliability is lower.\n"
-        )
-    return (
-        f"User question:\n{prompt}\n\n"
-        "Auction results (mileage ±25 000 km · year ±5 · semantic "
-        "condition search):\n"
-        f"{json.dumps(tool_result, indent=2)}\n\n"
-        f"{warnings_block}"
-        "Interpretation notes:\n"
-        "• Mileage ranges are ±25 000 km.\n"
-        "• Condition grouping may use semantic embeddings.\n"
-        f"{extras}\n"
-        "Using ONLY the data above, provide:\n"
-        "• A fair bid / price range **in Rands**.\n"
-        "• Assumptions and reasoning.\n"
-        "• Uncertainty caveats and data-sparseness notes.\n"
-    )
