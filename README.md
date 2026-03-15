@@ -1,3 +1,6 @@
+
+
+```markdown
 # Car Auction Intelligence API
 
 LLM-powered natural-language interface to a vehicle auction database.
@@ -65,7 +68,57 @@ make embedding-status
 make api
 ```
 
-## Test the API
+## Chat Interface (Open WebUI)
+
+The recommended way to interact with the API is through
+[Open WebUI](https://github.com/open-webui/open-webui) — a
+self-hosted ChatGPT-style interface that connects to any
+OpenAI-compatible backend.
+
+**Start Open WebUI** (in a new terminal):
+
+```bash
+docker run -d -p 3000:8080 --name open-webui \
+  --add-host=host.docker.internal:host-gateway \
+  ghcr.io/open-webui/open-webui:main
+```
+
+**Connect it to the API:**
+
+1. Open `http://localhost:3000` and create an admin account
+2. Go to **Admin Panel** → **Settings** → **Connections**
+3. Under **OpenAI API**, click **＋** and enter:
+
+   | Field | Value |
+   |---|---|
+   | **URL** | `http://host.docker.internal:8000/v1` |
+   | **API Key** | `no-key` |
+
+4. Click the **verify** button (🔄) — it should find `auction-intelligence-v1`
+5. **Save**, go back to chat, select **auction-intelligence-v1** from the model dropdown, and start asking questions
+
+> **Note:** Responses take **30–60 seconds** on average. The agent is
+> running tool calls behind the scenes (planning a query, executing SQL,
+> summarising results). Open WebUI shows a loading indicator while this
+> happens. Streaming kicks in once the final answer is ready — you'll
+> see it appear token by token.
+
+**Example conversation:**
+
+```
+You:  What is the average bid for a Renault Kwid 2019?
+Bot:  Based on auction data… R45,000 …
+
+You:  What about 2020?
+Bot:  ← understands you still mean Renault Kwid, just a different year
+```
+
+> On **Linux**, replace `host.docker.internal` with your machine's LAN
+> IP (e.g. `http://192.168.1.x:8000/v1`).
+
+## Test via CLI
+
+If you prefer the terminal, these Make targets are available:
 
 ```bash
 # Health check
@@ -78,7 +131,8 @@ make test-chat
 make test-stdout-stream
 ```
 
-### curl examples
+<details>
+<summary><strong>curl examples</strong></summary>
 
 **Non-streaming:**
 
@@ -107,6 +161,8 @@ curl -sN -X POST http://localhost:8000/v1/chat/completions \
   }'
 ```
 
+</details>
+
 ## API Reference
 
 ### Endpoints
@@ -121,7 +177,8 @@ curl -sN -X POST http://localhost:8000/v1/chat/completions \
 
 Since the API is OpenAI-compatible, any OpenAI SDK works as a client.
 
-**TypeScript — Vercel AI SDK**
+<details>
+<summary><strong>TypeScript — Vercel AI SDK</strong></summary>
 
 ```typescript
 import { createOpenAI } from "@ai-sdk/openai";
@@ -142,7 +199,10 @@ for await (const chunk of textStream) {
 }
 ```
 
-**Python — OpenAI SDK**
+</details>
+
+<details>
+<summary><strong>Python — OpenAI SDK</strong></summary>
 
 ```python
 from openai import OpenAI
@@ -163,6 +223,8 @@ for chunk in stream:
     if content:
         print(content, end="", flush=True)
 ```
+
+</details>
 
 ## Make Targets
 
@@ -308,20 +370,22 @@ Replace it with any strategy you need:
 
 ```
 ┌──────────────────────────────────────────────────────┐
-│  Client (curl / AI SDK / frontend)                   │
+│  Client (Open WebUI / SDK / curl)                    │
 │  POST /v1/chat/completions                           │
 └──────────────────┬───────────────────────────────────┘
                    │
                    ▼
 ┌──────────────────────────────────────────────────────┐
 │  main.py — OpenAI-compatible endpoint                │
-│  Auth → extract prompt → stream or block             │
+│  Auth → extract prompt + history → stream or block   │
 └──────────────────┬───────────────────────────────────┘
                    │
                    ▼
 ┌──────────────────────────────────────────────────────┐
-│  agent.py — Tool-calling loop                        │
-│  SYSTEM_PROMPT + user message → LLM                  │
+│  agent.py — Tool-calling loop (with conversation     │
+│  history for multi-turn context)                     │
+│                                                      │
+│  SYSTEM_PROMPT + history + user message → LLM        │
 │                                                      │
 │  ┌─ LLM says call tool ──────────────────────────┐   │
 │  │  tools.py — parse QueryPlan                   │   │
@@ -343,8 +407,8 @@ Replace it with any strategy you need:
 ### Request lifecycle
 
 1. **Client** sends a chat completion request with a natural-language question
-2. **`main.py`** validates auth, extracts the last user message as the prompt
-3. **`agent.py`** wraps the prompt with a system prompt containing the database schema and sends it to the LLM
+2. **`main.py`** validates auth, extracts the prompt and conversation history
+3. **`agent.py`** wraps the history with a system prompt containing the database schema and sends it to the LLM
 4. The **LLM** returns a tool call with a structured `QueryPlan` dict
 5. **`tools.py`** validates the plan with Pydantic and passes it to the compiler
 6. **`compiler.py`** translates the QueryPlan into a parameterised SQL query
@@ -352,6 +416,11 @@ Replace it with any strategy you need:
 8. **`database.py`** executes the query and returns rows
 9. The result is fed back to the **LLM** for summarisation
 10. The final answer is streamed back as SSE chunks or returned as a single JSON response
+
+> **Why do responses take 30–60 seconds?** The agent makes multiple LLM
+> calls behind the scenes: one to plan the query, one to process tool
+> results, and one to write the final answer. Each call runs through
+> Ollama on local hardware. Faster GPUs and smaller models reduce this.
 
 ## Adapting to Your Own Data
 
@@ -432,3 +501,4 @@ auction_api/
 ## License
 
 This project is licensed under the [MIT License](https://opensource.org/licenses/MIT).
+```

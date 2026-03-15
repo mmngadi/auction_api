@@ -191,11 +191,12 @@ async def list_models():
 )
 async def chat_completions(req: ChatCompletionRequest):
     prompt = _extract_prompt(req.messages)
+    history = _build_history(req.messages)
 
     # ── streaming ────────────────────────────────────────────
     if req.stream:
         return StreamingResponse(
-            _stream_response(prompt, req.model),
+            _stream_response(prompt, req.model, history),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -205,7 +206,7 @@ async def chat_completions(req: ChatCompletionRequest):
         )
 
     # ── non-streaming ────────────────────────────────────────
-    answer = run_agent(prompt)
+    answer = run_agent(prompt, history)
     return ChatCompletionResponse(
         id=_chat_id(),
         created=_now(),
@@ -213,14 +214,10 @@ async def chat_completions(req: ChatCompletionRequest):
         choices=[_Choice(message=Message(role="assistant", content=answer))],
     )
 
-
-# ─────────────────────────────────────────────────────────────
-# INTERNAL HELPERS
-# ─────────────────────────────────────────────────────────────
-
+# ── Helpers ──────────────────────────────────────────────────
 
 def _extract_prompt(messages: List[Message]) -> str:
-    """Return the last user message. Raises 400 if none found."""
+    """Return the last user message content."""
     for msg in reversed(messages):
         if msg.role == "user":
             return msg.content
@@ -233,6 +230,10 @@ def _extract_prompt(messages: List[Message]) -> str:
         ),
     )
 
+
+def _build_history(messages: List[Message]) -> list[dict]:
+    """Convert the full conversation to simple dicts for the agent."""
+    return [{"role": m.role, "content": m.content} for m in messages]
 
 def _chat_id() -> str:
     return f"chatcmpl-{uuid.uuid4().hex[:24]}"
@@ -268,17 +269,17 @@ def _chunk(
     }
 
 
-def _stream_response(prompt: str, model: str) -> Generator[str, None, None]:
+def _stream_response(
+    prompt: str, model: str, history: list[dict]
+) -> Generator[str, None, None]:
     """Sync generator — FastAPI runs this in a threadpool automatically."""
     cid = _chat_id()
     ts = _now()
 
-    # 1. Role header
     yield _sse(_chunk(cid, ts, model, delta={"role": "assistant"}))
 
-    # 2. Content tokens  (tool loop blocks, then summarisation streams)
     try:
-        for token in run_agent_stream(prompt):
+        for token in run_agent_stream(prompt, history):
             if token:
                 yield _sse(_chunk(cid, ts, model, delta={"content": token}))
     except Exception:
@@ -287,6 +288,5 @@ def _stream_response(prompt: str, model: str) -> Generator[str, None, None]:
             _chunk(cid, ts, model, delta={"content": "\n\n[Error generating response]"})
         )
 
-    # 3. Stop sentinel
     yield _sse(_chunk(cid, ts, model, delta={}, finish_reason="stop"))
     yield "data: [DONE]\n\n"

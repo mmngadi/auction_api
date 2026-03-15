@@ -14,7 +14,7 @@ import logging
 import re
 from typing import Any, Dict, Generator, Optional, Tuple
 
-from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_ollama import ChatOllama
 
 from .config import settings
@@ -187,22 +187,23 @@ _llm_with_tools = _llm.bind_tools(_TOOLS)
 # ─────────────────────────────────────────────────────────────
 
 
-def run_agent(prompt: str) -> str:
+def run_agent(prompt: str, history: list[dict] | None = None) -> str:
     """Non-streaming: returns the complete answer string."""
-    messages, tool_result, direct = _run_tool_loop(prompt)
+    messages, tool_result, direct = _run_tool_loop(prompt, history)
     if tool_result is not None:
         return _summarise(prompt, tool_result, messages)
     return direct or "No response generated — please rephrase your question."
 
 
-def run_agent_stream(prompt: str) -> Generator[str, None, None]:
+def run_agent_stream(
+    prompt: str, history: list[dict] | None = None
+) -> Generator[str, None, None]:
     """Streaming: yields text chunks as the summarisation LLM produces them."""
-    messages, tool_result, direct = _run_tool_loop(prompt)
+    messages, tool_result, direct = _run_tool_loop(prompt, history)
     if tool_result is not None:
         yield from _summarise_stream(prompt, tool_result, messages)
     else:
         yield direct or "No response generated — please rephrase your question."
-
 
 # ─────────────────────────────────────────────────────────────
 # TOOL LOOP  (shared by both paths)
@@ -211,20 +212,29 @@ def run_agent_stream(prompt: str) -> Generator[str, None, None]:
 
 def _run_tool_loop(
     prompt: str,
+    history: list[dict] | None = None,
 ) -> Tuple[list, Optional[Dict[str, Any]], Optional[str]]:
     """
     Execute the agent's tool-calling loop.
 
-    Returns
-    -------
-    (messages, tool_result, direct_content)
-        • tool_result is the best successful result, or None.
-        • direct_content is set when the LLM answered without tools.
+    If conversation history is provided the LLM sees all prior turns,
+    giving it context for follow-up questions like "What about 2020?".
     """
-    messages: list = [
-        SystemMessage(content=SYSTEM_PROMPT),
-        HumanMessage(content=prompt),
-    ]
+    messages: list = [SystemMessage(content=SYSTEM_PROMPT)]
+
+    if history:
+        for msg in history:
+            role = msg["role"]
+            content = msg["content"]
+            if role == "user":
+                messages.append(HumanMessage(content=content))
+            elif role == "assistant":
+                messages.append(AIMessage(content=content))
+            # "system" messages from the client are ignored —
+            # we use our own SYSTEM_PROMPT
+    else:
+        # Backward compatibility: no history, just the prompt
+        messages.append(HumanMessage(content=prompt))
 
     best_result: Optional[Dict[str, Any]] = None
     latest_result: Optional[Dict[str, Any]] = None
