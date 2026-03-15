@@ -1,6 +1,3 @@
-
-
-```markdown
 # Car Auction Intelligence API
 
 LLM-powered natural-language interface to a vehicle auction database.
@@ -501,4 +498,3 @@ auction_api/
 ## License
 
 This project is licensed under the [MIT License](https://opensource.org/licenses/MIT).
-```
