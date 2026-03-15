@@ -20,6 +20,12 @@ ollama pull nomic-embed-text
 ollama pull qwen3.5:9b
 ```
 
+**Then serve the Ollama local endpoint:**
+
+```bash
+ollama serve
+```
+
 ## Quick Start
 
 ```bash
