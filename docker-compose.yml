@@ -1,0 +1,23 @@
+services:
+  auction_db:
+    image: pgvector/pgvector:pg16
+    container_name: auction-db
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: auction
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+      - ./dataset/dataset.csv:/docker-entrypoint-initdb.d/dataset.csv:ro
+      - auction_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d auction"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  auction_pgdata:
